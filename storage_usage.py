@@ -8,16 +8,21 @@ storage_usage.py [--user USER] [--db SQLALCHEMY_URL]
                  [--summary-html FILE]
                  [--nice N] [--ionice-class {1,2,3}] [--ionice-level {0..7}]
                  PATH
+
+storage_usage.py --serve [--port PORT] [--db SQLALCHEMY_URL]
 """
 
 import argparse
+import json
 import os
 import pwd
 import socket
 import stat
 import sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Optional, Set
+from urllib.parse import parse_qs, urlparse
 
 import sqlalchemy as sa
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
@@ -368,6 +373,367 @@ def generate_summary_html(session: Session, output: Path, top_n: int = 20) -> No
 
 
 # ---------------------------------------------------------------------------
+# Web server
+# ---------------------------------------------------------------------------
+
+_SERVE_HTML = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Storage Usage</title>
+  <style>
+    body { font-family: sans-serif; margin: 2em; max-width: 1400px; }
+    h1   { color: #333; }
+    h2   { color: #555; margin-top: 2em; }
+    table { border-collapse: collapse; width: 100%; margin-top: 0.5em; }
+    th, td { border: 1px solid #ccc; padding: 6px 10px; text-align: left; word-break: break-all; }
+    th     { background: #eee; }
+    tr:nth-child(even) { background: #f9f9f9; }
+    .num   { text-align: right; white-space: nowrap; }
+    .check { text-align: center; }
+    .filters { display: flex; gap: 1.5em; flex-wrap: wrap; margin-bottom: 1em; align-items: flex-end; }
+    .filters label { display: flex; flex-direction: column; font-size: 0.85em;
+                     font-weight: bold; gap: 4px; color: #555; }
+    .filters input[type=text] { padding: 5px 8px; border: 1px solid #ccc;
+                                 border-radius: 3px; font-size: 1em; min-width: 160px; }
+    .filters input[type=range] { width: 180px; cursor: pointer; }
+    .size-label { font-weight: normal; font-size: 0.9em; color: #333; }
+    .pagination { display: flex; gap: 0.5em; margin-top: 1em; align-items: center; }
+    .pagination button { padding: 5px 14px; cursor: pointer; border: 1px solid #ccc;
+                         background: #fff; border-radius: 3px; font-size: 0.9em; }
+    .pagination button:disabled { opacity: 0.35; cursor: default; }
+    .page-info { color: #555; font-size: 0.9em; }
+    .empty { color: #888; font-style: italic; }
+  </style>
+</head>
+<body>
+<h1>Storage Usage</h1>
+
+<h2>Files</h2>
+<div class="filters">
+  <label>Host
+    <input type="text" id="f-host" placeholder="substring\u2026">
+  </label>
+  <label>Path
+    <input type="text" id="f-path" placeholder="substring\u2026">
+  </label>
+  <label>Kind
+    <input type="text" id="f-kind" placeholder="substring\u2026">
+  </label>
+  <label>Min Size: <span class="size-label" id="f-size-lbl">0 B</span>
+    <input type="range" id="f-size" min="0" max="6" value="0" step="1">
+  </label>
+</div>
+<table>
+  <thead>
+    <tr><th>Host</th><th>Path</th><th>Kind</th><th class="num">Size</th></tr>
+  </thead>
+  <tbody id="f-tbody">
+    <tr><td colspan="4" class="empty">Loading\u2026</td></tr>
+  </tbody>
+</table>
+<div class="pagination">
+  <button id="f-prev">&#8592; Prev</button>
+  <span class="page-info" id="f-info"></span>
+  <button id="f-next">Next &#8594;</button>
+</div>
+
+<h2>Directories</h2>
+<div class="filters">
+  <label>Host
+    <input type="text" id="d-host" placeholder="substring\u2026">
+  </label>
+  <label>Path
+    <input type="text" id="d-path" placeholder="substring\u2026">
+  </label>
+  <label>Min Size: <span class="size-label" id="d-size-lbl">0 B</span>
+    <input type="range" id="d-size" min="0" max="6" value="0" step="1">
+  </label>
+</div>
+<table>
+  <thead>
+    <tr><th>Host</th><th>Path</th><th class="num">Size</th><th class="check">Complete</th></tr>
+  </thead>
+  <tbody id="d-tbody">
+    <tr><td colspan="4" class="empty">Loading\u2026</td></tr>
+  </tbody>
+</table>
+<div class="pagination">
+  <button id="d-prev">&#8592; Prev</button>
+  <span class="page-info" id="d-info"></span>
+  <button id="d-next">Next &#8594;</button>
+</div>
+
+<script>
+// Size thresholds: 0 B, 1 KB, 1 MB, 1 GB, 1 TB, 1 PB, 1 EB
+const THRESHOLDS = [0, 1024, 1048576, 1073741824, 1099511627776,
+                    1125899906842624, 1152921504606846976];
+const THRESHOLD_LABELS = ['0 B', '1 KB', '1 MB', '1 GB', '1 TB', '1 PB', '1 EB'];
+
+function formatSize(b) {
+  const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB', 'EB'];
+  let v = Number(b);
+  for (const u of units) {
+    if (Math.abs(v) < 1024) return v.toFixed(1) + '\u00a0' + u;
+    v /= 1024;
+  }
+  return v.toFixed(1) + '\u00a0EB';
+}
+
+function esc(s) {
+  return String(s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+const filesState = { page: 1, host: '', path: '', kind: '', minSizeIdx: 0 };
+const dirsState  = { page: 1, host: '', path: '', minSizeIdx: 0 };
+
+async function fetchFiles() {
+  const s = filesState;
+  const p = new URLSearchParams({
+    page: s.page, per_page: 20,
+    host: s.host, path: s.path, kind: s.kind,
+    min_size: THRESHOLDS[s.minSizeIdx],
+  });
+  const resp = await fetch('/api/files?' + p);
+  const data = await resp.json();
+  const tbody = document.getElementById('f-tbody');
+  if (!data.rows.length) {
+    tbody.innerHTML = '<tr><td colspan="4" class="empty">No records match the current filters.</td></tr>';
+  } else {
+    tbody.innerHTML = data.rows.map(r =>
+      '<tr>' +
+      '<td>' + esc(r.host_id) + '</td>' +
+      '<td>' + esc(r.path) + '</td>' +
+      '<td>' + esc(r.kind) + '</td>' +
+      '<td class="num">' + formatSize(r.size) + '</td>' +
+      '</tr>'
+    ).join('');
+  }
+  document.getElementById('f-info').textContent =
+    'Page\u00a0' + data.page + '\u00a0/\u00a0' + data.total_pages +
+    '\u2002\u2014\u2002' + data.total.toLocaleString() + '\u00a0records';
+  document.getElementById('f-prev').disabled = data.page <= 1;
+  document.getElementById('f-next').disabled = data.page >= data.total_pages;
+}
+
+async function fetchDirs() {
+  const s = dirsState;
+  const p = new URLSearchParams({
+    page: s.page, per_page: 20,
+    host: s.host, path: s.path,
+    min_size: THRESHOLDS[s.minSizeIdx],
+  });
+  const resp = await fetch('/api/dirs?' + p);
+  const data = await resp.json();
+  const tbody = document.getElementById('d-tbody');
+  if (!data.rows.length) {
+    tbody.innerHTML = '<tr><td colspan="4" class="empty">No records match the current filters.</td></tr>';
+  } else {
+    tbody.innerHTML = data.rows.map(r =>
+      '<tr>' +
+      '<td>' + esc(r.host_id) + '</td>' +
+      '<td>' + esc(r.path) + '</td>' +
+      '<td class="num">' + formatSize(r.size) + '</td>' +
+      '<td class="check">' + (r.complete ? '\u2713' : '\u2717') + '</td>' +
+      '</tr>'
+    ).join('');
+  }
+  document.getElementById('d-info').textContent =
+    'Page\u00a0' + data.page + '\u00a0/\u00a0' + data.total_pages +
+    '\u2002\u2014\u2002' + data.total.toLocaleString() + '\u00a0records';
+  document.getElementById('d-prev').disabled = data.page <= 1;
+  document.getElementById('d-next').disabled = data.page >= data.total_pages;
+}
+
+function debounce(fn, ms) {
+  let t;
+  return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); };
+}
+
+// Files filters
+['f-host', 'f-path', 'f-kind'].forEach(id => {
+  const key = id.slice(2); // 'host', 'path', 'kind'
+  document.getElementById(id).addEventListener('input', debounce(e => {
+    filesState[key] = e.target.value;
+    filesState.page = 1;
+    fetchFiles();
+  }, 300));
+});
+document.getElementById('f-size').addEventListener('input', e => {
+  filesState.minSizeIdx = +e.target.value;
+  filesState.page = 1;
+  document.getElementById('f-size-lbl').textContent = THRESHOLD_LABELS[filesState.minSizeIdx];
+  fetchFiles();
+});
+document.getElementById('f-prev').addEventListener('click', () => { filesState.page--; fetchFiles(); });
+document.getElementById('f-next').addEventListener('click', () => { filesState.page++; fetchFiles(); });
+
+// Dirs filters
+['d-host', 'd-path'].forEach(id => {
+  const key = id.slice(2);
+  document.getElementById(id).addEventListener('input', debounce(e => {
+    dirsState[key] = e.target.value;
+    dirsState.page = 1;
+    fetchDirs();
+  }, 300));
+});
+document.getElementById('d-size').addEventListener('input', e => {
+  dirsState.minSizeIdx = +e.target.value;
+  dirsState.page = 1;
+  document.getElementById('d-size-lbl').textContent = THRESHOLD_LABELS[dirsState.minSizeIdx];
+  fetchDirs();
+});
+document.getElementById('d-prev').addEventListener('click', () => { dirsState.page--; fetchDirs(); });
+document.getElementById('d-next').addEventListener('click', () => { dirsState.page++; fetchDirs(); });
+
+// Initial load
+fetchFiles();
+fetchDirs();
+</script>
+</body>
+</html>
+"""
+
+
+def serve_db(engine: sa.Engine, port: int) -> None:
+    """Start an HTTP server that provides a live web UI over *engine*.
+
+    Routes
+    ------
+    GET /              – HTML single-page application
+    GET /api/files     – JSON: paginated file records (filterable)
+    GET /api/dirs      – JSON: paginated prefix records (filterable)
+
+    Query parameters for both API endpoints
+    ----------------------------------------
+    page      – 1-based page number (default 1)
+    per_page  – records per page (default 20, max 100)
+    host      – substring filter on host_id
+    path      – substring filter on path / prefix
+    min_size  – minimum size in bytes (integer; 0 = no filter)
+
+    Additional parameter for /api/files
+    ------------------------------------
+    kind      – substring filter on kind
+    """
+
+    class _Handler(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args):  # type: ignore[override]
+            """Print requests to stdout instead of stderr (default behaviour)."""
+            print(f"[{self.address_string()}] {fmt % args}")
+
+        def _send_json(self, obj: dict, status: int = 200) -> None:
+            body = json.dumps(obj).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _send_html(self, html: str) -> None:
+            body = html.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self) -> None:  # noqa: N802
+            parsed = urlparse(self.path)
+            qs = parse_qs(parsed.query)
+
+            def first(key: str, default: str = "") -> str:
+                return qs.get(key, [default])[0]
+
+            if parsed.path == "/":
+                self._send_html(_SERVE_HTML)
+                return
+
+            if parsed.path in ("/api/files", "/api/dirs"):
+                try:
+                    page = max(1, int(first("page", "1")))
+                    per_page = max(1, min(100, int(first("per_page", "20"))))
+                    min_size = int(first("min_size", "0"))
+                except ValueError:
+                    self._send_json({"error": "invalid query parameter"}, 400)
+                    return
+
+                host_filter = first("host")
+                path_filter = first("path")
+
+                with Session(engine) as session:
+                    if parsed.path == "/api/files":
+                        kind_filter = first("kind")
+                        q = session.query(FileRecord)
+                        if host_filter:
+                            q = q.filter(FileRecord.host_id.contains(host_filter))
+                        if path_filter:
+                            q = q.filter(FileRecord.path.contains(path_filter))
+                        if kind_filter:
+                            q = q.filter(FileRecord.kind.contains(kind_filter))
+                        if min_size > 0:
+                            q = q.filter(FileRecord.size >= min_size)
+                        q = q.order_by(FileRecord.size.desc())
+                        total: int = q.count()
+                        rows_f = q.offset((page - 1) * per_page).limit(per_page).all()
+                        total_pages = max(1, (total + per_page - 1) // per_page)
+                        self._send_json({
+                            "page": page,
+                            "total_pages": total_pages,
+                            "total": total,
+                            "rows": [
+                                {
+                                    "host_id": r.host_id,
+                                    "path": r.path,
+                                    "kind": r.kind,
+                                    "size": r.size,
+                                }
+                                for r in rows_f
+                            ],
+                        })
+                    else:  # /api/dirs
+                        q2 = session.query(PrefixRecord)
+                        if host_filter:
+                            q2 = q2.filter(PrefixRecord.host_id.contains(host_filter))
+                        if path_filter:
+                            q2 = q2.filter(PrefixRecord.prefix.contains(path_filter))
+                        if min_size > 0:
+                            q2 = q2.filter(PrefixRecord.size >= min_size)
+                        q2 = q2.order_by(PrefixRecord.size.desc())
+                        total2: int = q2.count()
+                        rows_d = q2.offset((page - 1) * per_page).limit(per_page).all()
+                        total_pages2 = max(1, (total2 + per_page - 1) // per_page)
+                        self._send_json({
+                            "page": page,
+                            "total_pages": total_pages2,
+                            "total": total2,
+                            "rows": [
+                                {
+                                    "host_id": r.host_id,
+                                    "path": r.prefix,
+                                    "size": r.size,
+                                    "complete": r.complete,
+                                }
+                                for r in rows_d
+                            ],
+                        })
+                return
+
+            self.send_response(404)
+            self.end_headers()
+
+    httpd = HTTPServer(("", port), _Handler)
+    print(f"Serving on http://localhost:{port}/ — press Ctrl+C to stop")
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\nServer stopped.")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -377,14 +743,17 @@ def build_parser() -> argparse.ArgumentParser:
         prog="storage_usage.py",
         description=(
             "Scan a directory tree and build a database of storage usage "
-            "for files owned by a given user."
+            "for files owned by a given user, or serve a live web UI over "
+            "an existing database."
         ),
     )
     parser.add_argument(
         "path",
         metavar="PATH",
         type=Path,
-        help="Root path to scan.",
+        nargs="?",
+        default=None,
+        help="Root path to scan (required unless --serve is given).",
     )
     parser.add_argument(
         "--user",
@@ -407,6 +776,22 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="Write an HTML summary of the database to FILE.",
+    )
+    parser.add_argument(
+        "--serve",
+        action="store_true",
+        default=False,
+        help=(
+            "Start a web UI that browses the database instead of scanning. "
+            "PATH is not required in this mode."
+        ),
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8080,
+        metavar="PORT",
+        help="Port for the --serve web UI (default: 8080).",
     )
     parser.add_argument(
         "--nice",
@@ -441,6 +826,17 @@ def main(argv: Optional[list[str]] = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    engine = sa.create_engine(args.db)
+    Base.metadata.create_all(engine)
+
+    if args.serve:
+        serve_db(engine, args.port)
+        return
+
+    # Scan mode – PATH is required.
+    if args.path is None:
+        parser.error("PATH is required unless --serve is given")
+
     # Re-exec under nice/ionice before doing any real work.
     apply_nice_ionice(args.nice, args.ionice_class, args.ionice_level)
 
@@ -449,9 +845,6 @@ def main(argv: Optional[list[str]] = None) -> None:
 
     uid = resolve_uid(args.user)
     host_id = socket.getfqdn()
-
-    engine = sa.create_engine(args.db)
-    Base.metadata.create_all(engine)
 
     with Session(engine) as session:
         complete_prefixes = load_complete_prefixes(session, host_id)

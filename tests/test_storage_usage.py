@@ -1,9 +1,14 @@
 """Tests for storage_usage.py"""
 
+import json
 import os
 import socket
 import stat
 import textwrap
+import threading
+import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 from unittest.mock import patch
 
@@ -27,6 +32,7 @@ from storage_usage import (
     main,
     resolve_uid,
     scan,
+    serve_db,
     update_prefix_sizes,
 )
 
@@ -351,9 +357,24 @@ class TestCLI:
         assert args.user is None
         assert args.db == "sqlite:///storage_usage.db"
         assert args.summary_html is None
+        assert args.serve is False
+        assert args.port == 8080
         assert args.nice is None
         assert args.ionice_class is None
         assert args.ionice_level is None
+
+    def test_serve_flag_parsed(self):
+        parser = build_parser()
+        args = parser.parse_args(["--serve", "--port", "9090"])
+        assert args.serve is True
+        assert args.port == 9090
+        assert args.path is None
+
+    def test_missing_path_without_serve_errors(self, capsys):
+        with pytest.raises(SystemExit):
+            main([])
+        captured = capsys.readouterr()
+        assert "PATH" in captured.err
 
 
 # ---------------------------------------------------------------------------
@@ -422,3 +443,178 @@ class TestApplyNiceIonice:
         # nice follows
         assert "nice" in captured["args"]
         assert "-n5" in captured["args"]
+
+
+# ---------------------------------------------------------------------------
+# Web server tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def served_engine(tmp_tree, tmp_path):
+    """Engine with scanned data, served on a random port; yields (engine, port)."""
+    eng = sa.create_engine(f"sqlite:///{tmp_path / 'serve.db'}")
+    Base.metadata.create_all(eng)
+    with Session(eng) as s:
+        uid = os.getuid()
+        scan(tmp_tree, uid, HOST, s, set())
+        update_prefix_sizes(s, HOST)
+    return eng
+
+
+def _find_free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+@pytest.fixture()
+def live_server(served_engine):
+    """Start serve_db in a daemon thread; yield the port; shut down after test."""
+    port = _find_free_port()
+    from http.server import HTTPServer
+
+    t = threading.Thread(target=serve_db, args=(served_engine, port), daemon=True)
+    t.start()
+    # Wait for the server to be ready.
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        try:
+            urllib.request.urlopen(f"http://localhost:{port}/")
+            break
+        except Exception:
+            time.sleep(0.05)
+    yield port
+
+
+class TestServeDB:
+    def test_index_returns_html(self, live_server):
+        resp = urllib.request.urlopen(f"http://localhost:{live_server}/")
+        assert resp.status == 200
+        content_type = resp.headers.get("Content-Type", "")
+        assert "text/html" in content_type
+        body = resp.read().decode()
+        assert "Storage Usage" in body
+        assert "Files" in body
+        assert "Directories" in body
+
+    def test_api_files_returns_json(self, live_server):
+        resp = urllib.request.urlopen(f"http://localhost:{live_server}/api/files")
+        assert resp.status == 200
+        data = json.loads(resp.read())
+        assert "rows" in data
+        assert "total" in data
+        assert "page" in data
+        assert "total_pages" in data
+        assert data["total"] > 0
+        row = data["rows"][0]
+        assert "host_id" in row
+        assert "path" in row
+        assert "kind" in row
+        assert "size" in row
+
+    def test_api_files_ordered_by_size_desc(self, live_server):
+        resp = urllib.request.urlopen(f"http://localhost:{live_server}/api/files")
+        data = json.loads(resp.read())
+        sizes = [r["size"] for r in data["rows"]]
+        assert sizes == sorted(sizes, reverse=True)
+
+    def test_api_files_host_filter(self, live_server):
+        resp = urllib.request.urlopen(
+            f"http://localhost:{live_server}/api/files?host={HOST}"
+        )
+        data = json.loads(resp.read())
+        assert data["total"] > 0
+        assert all(HOST in r["host_id"] for r in data["rows"])
+
+    def test_api_files_host_filter_no_match(self, live_server):
+        resp = urllib.request.urlopen(
+            f"http://localhost:{live_server}/api/files?host=__no_such_host__"
+        )
+        data = json.loads(resp.read())
+        assert data["total"] == 0
+        assert data["rows"] == []
+
+    def test_api_files_path_filter(self, live_server):
+        resp = urllib.request.urlopen(
+            f"http://localhost:{live_server}/api/files?path=a.txt"
+        )
+        data = json.loads(resp.read())
+        assert data["total"] >= 1
+        assert all("a.txt" in r["path"] for r in data["rows"])
+
+    def test_api_files_kind_filter(self, live_server):
+        resp = urllib.request.urlopen(
+            f"http://localhost:{live_server}/api/files?kind=file"
+        )
+        data = json.loads(resp.read())
+        assert data["total"] > 0
+        assert all("file" in r["kind"] for r in data["rows"])
+
+    def test_api_files_min_size_filter(self, live_server):
+        # c.txt is 30 bytes, b.txt is 20, a.txt is 10.  min_size=25 => only c.txt.
+        resp = urllib.request.urlopen(
+            f"http://localhost:{live_server}/api/files?min_size=25"
+        )
+        data = json.loads(resp.read())
+        assert all(r["size"] >= 25 for r in data["rows"])
+
+    def test_api_files_pagination(self, live_server):
+        resp1 = urllib.request.urlopen(
+            f"http://localhost:{live_server}/api/files?per_page=1&page=1"
+        )
+        resp2 = urllib.request.urlopen(
+            f"http://localhost:{live_server}/api/files?per_page=1&page=2"
+        )
+        d1 = json.loads(resp1.read())
+        d2 = json.loads(resp2.read())
+        assert len(d1["rows"]) == 1
+        assert len(d2["rows"]) == 1
+        # Different records on different pages
+        assert d1["rows"][0]["path"] != d2["rows"][0]["path"]
+        assert d1["total_pages"] >= 2
+
+    def test_api_dirs_returns_json(self, live_server):
+        resp = urllib.request.urlopen(f"http://localhost:{live_server}/api/dirs")
+        assert resp.status == 200
+        data = json.loads(resp.read())
+        assert "rows" in data
+        assert data["total"] > 0
+        row = data["rows"][0]
+        assert "host_id" in row
+        assert "path" in row
+        assert "size" in row
+        assert "complete" in row
+
+    def test_api_dirs_ordered_by_size_desc(self, live_server):
+        resp = urllib.request.urlopen(f"http://localhost:{live_server}/api/dirs")
+        data = json.loads(resp.read())
+        sizes = [r["size"] for r in data["rows"]]
+        assert sizes == sorted(sizes, reverse=True)
+
+    def test_api_dirs_min_size_filter(self, live_server):
+        resp = urllib.request.urlopen(
+            f"http://localhost:{live_server}/api/dirs?min_size=1"
+        )
+        data = json.loads(resp.read())
+        assert all(r["size"] >= 1 for r in data["rows"])
+
+    def test_api_dirs_path_filter(self, live_server):
+        resp = urllib.request.urlopen(
+            f"http://localhost:{live_server}/api/dirs?path=sub"
+        )
+        data = json.loads(resp.read())
+        assert all("sub" in r["path"] for r in data["rows"])
+
+    def test_api_404(self, live_server):
+        try:
+            urllib.request.urlopen(f"http://localhost:{live_server}/no/such/path")
+            assert False, "Expected 404"
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 404
+
+    def test_html_contains_filter_inputs(self, live_server):
+        resp = urllib.request.urlopen(f"http://localhost:{live_server}/")
+        body = resp.read().decode()
+        assert 'type="range"' in body
+        assert "substring" in body

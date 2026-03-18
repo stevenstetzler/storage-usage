@@ -26,7 +26,13 @@ A command-line tool that recursively scans a directory tree, records the storage
 
 ## Installation
 
-Install directly from GitHub using pip:
+Install from [PyPI](https://pypi.org/project/storage-usage/):
+
+```bash
+pip install storage-usage
+```
+
+Or install directly from GitHub using pip:
 
 ```bash
 pip install git+https://github.com/stevenstetzler/storage-usage.git

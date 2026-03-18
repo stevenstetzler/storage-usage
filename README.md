@@ -24,23 +24,24 @@ A command-line tool that recursively scans a directory tree, records the storage
 
 ---
 
-## Getting the code
+## Installation
+
+Install directly from GitHub using pip:
+
+```bash
+pip install git+https://github.com/stevenstetzler/storage-usage.git
+```
+
+This installs the `storage-usage` command and all required dependencies.
+
+### Development installation
+
+Clone the repository and install in editable mode:
 
 ```bash
 git clone https://github.com/stevenstetzler/storage-usage.git
 cd storage-usage
-```
-
----
-
-## Installation
-
-Create and activate a virtual environment, then install the dependencies:
-
-```bash
-python -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
+pip install -e .
 ```
 
 ---
@@ -48,12 +49,12 @@ pip install -r requirements.txt
 ## Usage
 
 ```
-storage_usage.py [--user USER] [--db URL]
-                 [--summary-html FILE]
-                 [--nice N] [--ionice-class {1,2,3}] [--ionice-level {0..7}]
-                 PATH
+storage-usage [--user USER] [--db URL]
+              [--summary-html FILE]
+              [--nice N] [--ionice-class {1,2,3}] [--ionice-level {0..7}]
+              PATH
 
-storage_usage.py --serve [--port PORT] [--db URL]
+storage-usage --serve [--port PORT] [--db URL]
 ```
 
 ### Scan mode
@@ -61,25 +62,25 @@ storage_usage.py --serve [--port PORT] [--db URL]
 Scan a directory tree and persist the results to a database:
 
 ```bash
-python storage_usage.py /path/to/scan
+storage-usage /path/to/scan
 ```
 
 Scan a path for files owned by a specific user and write results to a named database:
 
 ```bash
-python storage_usage.py --user alice --db sqlite:///alice.db /home/alice
+storage-usage --user alice --db sqlite:///alice.db /home/alice
 ```
 
 Generate an HTML summary after scanning:
 
 ```bash
-python storage_usage.py /data --summary-html report.html
+storage-usage /data --summary-html report.html
 ```
 
 Run the scan at reduced priority so it does not affect other processes:
 
 ```bash
-python storage_usage.py --nice 19 --ionice-class 3 /data
+storage-usage --nice 19 --ionice-class 3 /data
 ```
 
 ### Serve mode
@@ -87,13 +88,13 @@ python storage_usage.py --nice 19 --ionice-class 3 /data
 Start the web UI to browse a previously built database:
 
 ```bash
-python storage_usage.py --serve
+storage-usage --serve
 ```
 
 Use a specific database and port:
 
 ```bash
-python storage_usage.py --serve --db sqlite:///alice.db --port 9090
+storage-usage --serve --db sqlite:///alice.db --port 9090
 ```
 
 Open `http://localhost:8080/` (or whichever port you chose) in your browser.

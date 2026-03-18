@@ -1,6 +1,7 @@
 """Tests for storage_usage.py"""
 
 import os
+import socket
 import stat
 import textwrap
 from pathlib import Path
@@ -142,53 +143,64 @@ class TestResolveUid:
 # Unit tests – database helpers
 # ---------------------------------------------------------------------------
 
+HOST = "testhost.example.com"
+
 
 class TestUpsertFile:
     def test_insert(self, session):
-        _upsert_file(session, "/tmp/x.txt", 100, "file")
+        _upsert_file(session, HOST, "/tmp/x.txt", 100, "file")
         session.commit()
-        rec = session.get(FileRecord, "/tmp/x.txt")
+        rec = session.get(FileRecord, (HOST, "/tmp/x.txt"))
         assert rec is not None
         assert rec.size == 100
         assert rec.kind == "file"
+        assert rec.host_id == HOST
 
     def test_update(self, session):
-        _upsert_file(session, "/tmp/x.txt", 100, "file")
+        _upsert_file(session, HOST, "/tmp/x.txt", 100, "file")
         session.commit()
-        _upsert_file(session, "/tmp/x.txt", 200, "file")
+        _upsert_file(session, HOST, "/tmp/x.txt", 200, "file")
         session.commit()
-        rec = session.get(FileRecord, "/tmp/x.txt")
+        rec = session.get(FileRecord, (HOST, "/tmp/x.txt"))
         assert rec.size == 200
 
 
 class TestUpsertPrefix:
     def test_insert(self, session):
-        _upsert_prefix(session, "/tmp", 500, complete=True)
+        _upsert_prefix(session, HOST, "/tmp", 500, complete=True)
         session.commit()
-        rec = session.get(PrefixRecord, "/tmp")
+        rec = session.get(PrefixRecord, (HOST, "/tmp"))
         assert rec is not None
         assert rec.complete is True
+        assert rec.host_id == HOST
 
     def test_update(self, session):
-        _upsert_prefix(session, "/tmp", 500, complete=False)
+        _upsert_prefix(session, HOST, "/tmp", 500, complete=False)
         session.commit()
-        _upsert_prefix(session, "/tmp", 999, complete=True)
+        _upsert_prefix(session, HOST, "/tmp", 999, complete=True)
         session.commit()
-        rec = session.get(PrefixRecord, "/tmp")
+        rec = session.get(PrefixRecord, (HOST, "/tmp"))
         assert rec.size == 999
         assert rec.complete is True
 
 
 class TestLoadCompletePrefixes:
     def test_empty(self, session):
-        assert load_complete_prefixes(session) == set()
+        assert load_complete_prefixes(session, HOST) == set()
 
     def test_returns_only_complete(self, session):
-        session.add(PrefixRecord(prefix="/a", size=0, complete=True))
-        session.add(PrefixRecord(prefix="/b", size=0, complete=False))
+        session.add(PrefixRecord(host_id=HOST, prefix="/a", size=0, complete=True))
+        session.add(PrefixRecord(host_id=HOST, prefix="/b", size=0, complete=False))
         session.commit()
-        result = load_complete_prefixes(session)
+        result = load_complete_prefixes(session, HOST)
         assert result == {"/a"}
+
+    def test_filters_by_host(self, session):
+        session.add(PrefixRecord(host_id="other.host", prefix="/a", size=0, complete=True))
+        session.add(PrefixRecord(host_id=HOST, prefix="/b", size=0, complete=True))
+        session.commit()
+        result = load_complete_prefixes(session, HOST)
+        assert result == {"/b"}
 
 
 # ---------------------------------------------------------------------------
@@ -199,20 +211,22 @@ class TestLoadCompletePrefixes:
 class TestScan:
     def test_basic_scan(self, tmp_tree, session):
         uid = os.getuid()
-        scan(tmp_tree, uid, session, set())
+        scan(tmp_tree, uid, HOST, session, set())
 
         files = session.query(FileRecord).all()
         paths = {f.path for f in files}
+        host_ids = {f.host_id for f in files}
 
         assert str(tmp_tree / "a.txt") in paths
         assert str(tmp_tree / "sub" / "b.txt") in paths
         assert str(tmp_tree / "sub" / "c.txt") in paths
+        assert host_ids == {HOST}
 
     def test_prefix_marked_complete(self, tmp_tree, session):
         uid = os.getuid()
-        scan(tmp_tree, uid, session, set())
+        scan(tmp_tree, uid, HOST, session, set())
 
-        root_prefix = session.get(PrefixRecord, str(tmp_tree))
+        root_prefix = session.get(PrefixRecord, (HOST, str(tmp_tree)))
         assert root_prefix is not None
         assert root_prefix.complete is True
 
@@ -221,32 +235,32 @@ class TestScan:
         sub = str(tmp_tree / "sub")
 
         # Mark the sub-directory as already complete.
-        session.add(PrefixRecord(prefix=sub, size=50, complete=True))
+        session.add(PrefixRecord(host_id=HOST, prefix=sub, size=50, complete=True))
         session.commit()
 
-        complete = load_complete_prefixes(session)
-        scan(tmp_tree, uid, session, complete)
+        complete = load_complete_prefixes(session, HOST)
+        scan(tmp_tree, uid, HOST, session, complete)
 
         # Files inside the skipped prefix must NOT have been (re-)inserted.
-        b = session.get(FileRecord, str(tmp_tree / "sub" / "b.txt"))
+        b = session.get(FileRecord, (HOST, str(tmp_tree / "sub" / "b.txt")))
         assert b is None
 
         # Files outside should still be scanned.
-        a = session.get(FileRecord, str(tmp_tree / "a.txt"))
+        a = session.get(FileRecord, (HOST, str(tmp_tree / "a.txt")))
         assert a is not None
 
     def test_wrong_uid_excluded(self, tmp_tree, session):
         # Use a UID that doesn't match anything on disk.
-        scan(tmp_tree, uid=999999, session=session, complete_prefixes=set())
+        scan(tmp_tree, uid=999999, host_id=HOST, session=session, complete_prefixes=set())
         files = session.query(FileRecord).all()
         assert files == []
 
     def test_update_prefix_sizes(self, tmp_tree, session):
         uid = os.getuid()
-        scan(tmp_tree, uid, session, set())
-        update_prefix_sizes(session)
+        scan(tmp_tree, uid, HOST, session, set())
+        update_prefix_sizes(session, HOST)
 
-        root_rec = session.get(PrefixRecord, str(tmp_tree))
+        root_rec = session.get(PrefixRecord, (HOST, str(tmp_tree)))
         # Recursive size should be >= the sum of all files under root
         assert root_rec.size >= 10 + 20 + 30  # a.txt + b.txt + c.txt
 
@@ -259,8 +273,8 @@ class TestScan:
 class TestGenerateSummaryHtml:
     def test_creates_file(self, tmp_tree, session, tmp_path):
         uid = os.getuid()
-        scan(tmp_tree, uid, session, set())
-        update_prefix_sizes(session)
+        scan(tmp_tree, uid, HOST, session, set())
+        update_prefix_sizes(session, HOST)
 
         out = tmp_path / "summary.html"
         generate_summary_html(session, out)
@@ -272,12 +286,21 @@ class TestGenerateSummaryHtml:
 
     def test_contains_file_paths(self, tmp_tree, session, tmp_path):
         uid = os.getuid()
-        scan(tmp_tree, uid, session, set())
+        scan(tmp_tree, uid, HOST, session, set())
 
         out = tmp_path / "summary.html"
         generate_summary_html(session, out)
         content = out.read_text()
         assert "a.txt" in content
+
+    def test_contains_host_id(self, tmp_tree, session, tmp_path):
+        uid = os.getuid()
+        scan(tmp_tree, uid, HOST, session, set())
+
+        out = tmp_path / "summary.html"
+        generate_summary_html(session, out)
+        content = out.read_text()
+        assert HOST in content
 
 
 # ---------------------------------------------------------------------------
@@ -294,6 +317,26 @@ class TestCLI:
         with Session(engine) as s:
             files = s.query(FileRecord).all()
         assert len(files) > 0
+
+    def test_host_id_stored(self, tmp_tree, tmp_path):
+        db_url = f"sqlite:///{tmp_path / 'test.db'}"
+        main([str(tmp_tree), "--db", db_url])
+
+        engine = sa.create_engine(db_url)
+        with Session(engine) as s:
+            files = s.query(FileRecord).all()
+        fqdn = socket.getfqdn()
+        assert all(f.host_id == fqdn for f in files)
+
+    def test_resolved_path_stored(self, tmp_tree, tmp_path):
+        db_url = f"sqlite:///{tmp_path / 'test.db'}"
+        main([str(tmp_tree), "--db", db_url])
+
+        engine = sa.create_engine(db_url)
+        expected_root = str(tmp_tree.resolve())
+        with Session(engine) as s:
+            prefixes = s.query(PrefixRecord).all()
+        assert any(p.prefix == expected_root for p in prefixes)
 
     def test_summary_html_created(self, tmp_tree, tmp_path):
         db_url = f"sqlite:///{tmp_path / 'test.db'}"

@@ -13,6 +13,7 @@ storage_usage.py [--user USER] [--db SQLALCHEMY_URL]
 import argparse
 import os
 import pwd
+import socket
 import stat
 import sys
 from pathlib import Path
@@ -35,6 +36,7 @@ class FileRecord(Base):
 
     __tablename__ = "files"
 
+    host_id: Mapped[str] = mapped_column(sa.String, primary_key=True)
     path: Mapped[str] = mapped_column(sa.String, primary_key=True)
     size: Mapped[int] = mapped_column(sa.Integer, nullable=False)
     kind: Mapped[str] = mapped_column(sa.String, nullable=False)
@@ -45,6 +47,7 @@ class PrefixRecord(Base):
 
     __tablename__ = "prefixes"
 
+    host_id: Mapped[str] = mapped_column(sa.String, primary_key=True)
     prefix: Mapped[str] = mapped_column(sa.String, primary_key=True)
     size: Mapped[int] = mapped_column(sa.Integer, nullable=False, default=0)
     complete: Mapped[bool] = mapped_column(
@@ -139,11 +142,14 @@ def apply_nice_ionice(
 # ---------------------------------------------------------------------------
 
 
-def load_complete_prefixes(session: Session) -> Set[str]:
+def load_complete_prefixes(session: Session, host_id: str) -> Set[str]:
     """Return the set of prefix strings already marked *complete* in the DB."""
     rows = (
         session.query(PrefixRecord.prefix)
-        .filter(PrefixRecord.complete.is_(True))
+        .filter(
+            PrefixRecord.host_id == host_id,
+            PrefixRecord.complete.is_(True),
+        )
         .all()
     )
     return {row.prefix for row in rows}
@@ -160,6 +166,7 @@ def _is_under_complete_prefix(path: str, complete: Set[str]) -> bool:
 def scan(
     root: Path,
     uid: int,
+    host_id: str,
     session: Session,
     complete_prefixes: Set[str],
 ) -> None:
@@ -187,7 +194,7 @@ def scan(
             entries = list(os.scandir(current))
         except OSError:
             # Permission denied or similar – record the prefix as incomplete
-            _upsert_prefix(session, current_str, 0, complete=False)
+            _upsert_prefix(session, host_id, current_str, 0, complete=False)
             session.commit()
             continue
 
@@ -208,33 +215,37 @@ def scan(
             kind = file_kind(st.st_mode)
             size = st.st_size
             direct_size += size
-            _upsert_file(session, entry.path, size, kind)
+            _upsert_file(session, host_id, entry.path, size, kind)
 
-        _upsert_prefix(session, current_str, direct_size, complete=True)
+        _upsert_prefix(session, host_id, current_str, direct_size, complete=True)
         session.commit()
 
 
-def _upsert_file(session: Session, path: str, size: int, kind: str) -> None:
-    existing = session.get(FileRecord, path)
+def _upsert_file(
+    session: Session, host_id: str, path: str, size: int, kind: str
+) -> None:
+    existing = session.get(FileRecord, (host_id, path))
     if existing is not None:
         existing.size = size
         existing.kind = kind
     else:
-        session.add(FileRecord(path=path, size=size, kind=kind))
+        session.add(FileRecord(host_id=host_id, path=path, size=size, kind=kind))
 
 
 def _upsert_prefix(
-    session: Session, prefix: str, size: int, *, complete: bool
+    session: Session, host_id: str, prefix: str, size: int, *, complete: bool
 ) -> None:
-    existing = session.get(PrefixRecord, prefix)
+    existing = session.get(PrefixRecord, (host_id, prefix))
     if existing is not None:
         existing.size = size
         existing.complete = complete
     else:
-        session.add(PrefixRecord(prefix=prefix, size=size, complete=complete))
+        session.add(
+            PrefixRecord(host_id=host_id, prefix=prefix, size=size, complete=complete)
+        )
 
 
-def update_prefix_sizes(session: Session) -> None:
+def update_prefix_sizes(session: Session, host_id: str) -> None:
     """Set each prefix's ``size`` to the **recursive** total of owned files.
 
     After scanning, the ``prefixes.size`` column holds only the *direct* bytes
@@ -244,8 +255,16 @@ def update_prefix_sizes(session: Session) -> None:
     # Build a mapping prefix -> total recursive size in Python.
     # For very large datasets a pure-SQL approach would be preferable, but
     # this implementation is straightforward and correct for all SQL backends.
-    prefixes = session.query(PrefixRecord).all()
-    files = session.query(FileRecord.path, FileRecord.size).all()
+    prefixes = (
+        session.query(PrefixRecord)
+        .filter(PrefixRecord.host_id == host_id)
+        .all()
+    )
+    files = (
+        session.query(FileRecord.path, FileRecord.size)
+        .filter(FileRecord.host_id == host_id)
+        .all()
+    )
 
     for prefix_rec in prefixes:
         p = prefix_rec.prefix + os.sep
@@ -284,9 +303,10 @@ _HTML_TEMPLATE = """\
 
 <h2>Largest Files (top {{ largest_files | length }})</h2>
 <table>
-  <tr><th>Path</th><th>Kind</th><th class="num">Size</th></tr>
+  <tr><th>Host</th><th>Path</th><th>Kind</th><th class="num">Size</th></tr>
   {% for f in largest_files %}
   <tr>
+    <td>{{ f.host_id }}</td>
     <td>{{ f.path }}</td>
     <td>{{ f.kind }}</td>
     <td class="num">{{ f.size | format_size }}</td>
@@ -296,9 +316,10 @@ _HTML_TEMPLATE = """\
 
 <h2>Largest Directory Prefixes (top {{ largest_prefixes | length }})</h2>
 <table>
-  <tr><th>Prefix</th><th class="num">Size</th><th class="check">Complete</th></tr>
+  <tr><th>Host</th><th>Prefix</th><th class="num">Size</th><th class="check">Complete</th></tr>
   {% for p in largest_prefixes %}
   <tr>
+    <td>{{ p.host_id }}</td>
     <td>{{ p.prefix }}</td>
     <td class="num">{{ p.size | format_size }}</td>
     <td class="check">{{ "✓" if p.complete else "✗" }}</td>
@@ -423,17 +444,21 @@ def main(argv: Optional[list[str]] = None) -> None:
     # Re-exec under nice/ionice before doing any real work.
     apply_nice_ionice(args.nice, args.ionice_class, args.ionice_level)
 
+    # Resolve to an absolute realpath so that the stored paths are canonical.
+    root = args.path.resolve()
+
     uid = resolve_uid(args.user)
+    host_id = socket.getfqdn()
 
     engine = sa.create_engine(args.db)
     Base.metadata.create_all(engine)
 
     with Session(engine) as session:
-        complete_prefixes = load_complete_prefixes(session)
+        complete_prefixes = load_complete_prefixes(session, host_id)
 
         print(
-            f"Scanning {args.path!s} "
-            f"for files owned by uid={uid}"
+            f"Scanning {root!s} "
+            f"for files owned by uid={uid} on {host_id}"
             + (
                 f" (skipping {len(complete_prefixes)} complete prefix(es))"
                 if complete_prefixes
@@ -441,8 +466,8 @@ def main(argv: Optional[list[str]] = None) -> None:
             )
         )
 
-        scan(args.path, uid, session, complete_prefixes)
-        update_prefix_sizes(session)
+        scan(root, uid, host_id, session, complete_prefixes)
+        update_prefix_sizes(session, host_id)
 
         print("Scan complete.")
 

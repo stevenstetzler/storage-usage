@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "storage-usage"
+version = "0.1.0"
+description = "Scan file-system storage, record results in a database, and serve a live web UI."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+dependencies = [
+    "Jinja2>=3.1",
+    "SQLAlchemy>=2.0",
+]
+
+[project.scripts]
+storage-usage = "storage_usage:main"
+
+[tool.setuptools]
+py-modules = ["storage_usage"]

@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=68", "setuptools-scm"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "storage-usage"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Scan file-system storage, record results in a database, and serve a live web UI."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -19,3 +19,6 @@ storage-usage = "storage_usage:main"
 
 [tool.setuptools]
 py-modules = ["storage_usage"]
+
+[tool.setuptools_scm]
+write_to = "_version.py"

@@ -20,9 +20,11 @@ from storage_usage import (
     Base,
     FileRecord,
     PrefixRecord,
+    UserRecord,
     _is_under_complete_prefix,
     _upsert_file,
     _upsert_prefix,
+    _upsert_user,
     apply_nice_ionice,
     build_parser,
     file_kind,
@@ -137,8 +139,8 @@ class TestIsUnderCompletePrefix:
 
 
 class TestResolveUid:
-    def test_current_user(self):
-        assert resolve_uid(None) == os.getuid()
+    def test_no_user_returns_none(self):
+        assert resolve_uid(None) is None
 
     def test_unknown_user_exits(self):
         with pytest.raises(SystemExit):
@@ -154,24 +156,55 @@ HOST = "testhost.example.com"
 
 class TestUpsertFile:
     def test_insert(self, session):
-        _upsert_file(session, HOST, "/tmp/x.txt", 100, "file")
+        uid = os.getuid()
+        _upsert_user(session, uid)
+        _upsert_file(session, HOST, "/tmp/x.txt", 100, "file", uid)
         session.commit()
         rec = session.get(FileRecord, (HOST, "/tmp/x.txt"))
         assert rec is not None
         assert rec.size == 100
         assert rec.kind == "file"
         assert rec.host_id == HOST
+        assert rec.uid == uid
 
     def test_update(self, session):
-        _upsert_file(session, HOST, "/tmp/x.txt", 100, "file")
+        uid = os.getuid()
+        _upsert_user(session, uid)
+        _upsert_file(session, HOST, "/tmp/x.txt", 100, "file", uid)
         session.commit()
-        _upsert_file(session, HOST, "/tmp/x.txt", 200, "file")
+        _upsert_file(session, HOST, "/tmp/x.txt", 200, "file", uid)
         session.commit()
         rec = session.get(FileRecord, (HOST, "/tmp/x.txt"))
         assert rec.size == 200
 
 
-class TestUpsertPrefix:
+class TestUpsertUser:
+    def test_insert(self, session):
+        uid = os.getuid()
+        _upsert_user(session, uid)
+        session.commit()
+        rec = session.get(UserRecord, uid)
+        assert rec is not None
+        assert rec.uid == uid
+        assert rec.username  # non-empty
+
+    def test_insert_unknown_uid_uses_str(self, session):
+        _upsert_user(session, 999999)
+        session.commit()
+        rec = session.get(UserRecord, 999999)
+        assert rec is not None
+        assert rec.username == "999999"
+
+    def test_idempotent(self, session):
+        uid = os.getuid()
+        _upsert_user(session, uid)
+        _upsert_user(session, uid)
+        session.commit()
+        count = session.query(UserRecord).filter(UserRecord.uid == uid).count()
+        assert count == 1
+
+
+
     def test_insert(self, session):
         _upsert_prefix(session, HOST, "/tmp", 500, complete=True)
         session.commit()
@@ -261,6 +294,27 @@ class TestScan:
         files = session.query(FileRecord).all()
         assert files == []
 
+    def test_scan_all_when_uid_is_none(self, tmp_tree, session):
+        # uid=None should scan all accessible files regardless of owner.
+        scan(tmp_tree, uid=None, host_id=HOST, session=session, complete_prefixes=set())
+        files = session.query(FileRecord).all()
+        paths = {f.path for f in files}
+        assert str(tmp_tree / "a.txt") in paths
+        assert str(tmp_tree / "sub" / "b.txt") in paths
+        assert str(tmp_tree / "sub" / "c.txt") in paths
+        # Each file record should have a uid and a corresponding user row.
+        for rec in files:
+            user = session.get(UserRecord, rec.uid)
+            assert user is not None
+
+    def test_users_inserted_during_scan(self, tmp_tree, session):
+        uid = os.getuid()
+        scan(tmp_tree, uid, HOST, session, set())
+        user = session.get(UserRecord, uid)
+        assert user is not None
+        assert user.uid == uid
+        assert user.username  # non-empty string
+
     def test_update_prefix_sizes(self, tmp_tree, session):
         uid = os.getuid()
         scan(tmp_tree, uid, HOST, session, set())
@@ -323,6 +377,18 @@ class TestCLI:
         with Session(engine) as s:
             files = s.query(FileRecord).all()
         assert len(files) > 0
+
+    def test_users_stored_in_db(self, tmp_tree, tmp_path):
+        db_url = f"sqlite:///{tmp_path / 'test.db'}"
+        main([str(tmp_tree), "--db", db_url])
+
+        engine = sa.create_engine(db_url)
+        with Session(engine) as s:
+            users = s.query(UserRecord).all()
+        assert len(users) > 0
+        for u in users:
+            assert u.uid is not None
+            assert u.username  # non-empty
 
     def test_host_id_stored(self, tmp_tree, tmp_path):
         db_url = f"sqlite:///{tmp_path / 'test.db'}"

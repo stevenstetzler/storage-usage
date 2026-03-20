@@ -36,6 +36,15 @@ class Base(DeclarativeBase):
     pass
 
 
+class UserRecord(Base):
+    """One row per unique user (uid/username pair) encountered during scanning."""
+
+    __tablename__ = "users"
+
+    uid: Mapped[int] = mapped_column(sa.Integer, primary_key=True, nullable=False)
+    username: Mapped[str] = mapped_column(sa.String, nullable=False)
+
+
 class FileRecord(Base):
     """One row per file-system entry belonging to the scanned user."""
 
@@ -45,6 +54,9 @@ class FileRecord(Base):
     path: Mapped[str] = mapped_column(sa.String, primary_key=True)
     size: Mapped[int] = mapped_column(sa.Integer, nullable=False)
     kind: Mapped[str] = mapped_column(sa.String, nullable=False)
+    uid: Mapped[int] = mapped_column(
+        sa.Integer, sa.ForeignKey("users.uid"), nullable=False
+    )
 
 
 class PrefixRecord(Base):
@@ -65,10 +77,14 @@ class PrefixRecord(Base):
 # ---------------------------------------------------------------------------
 
 
-def resolve_uid(user: Optional[str]) -> int:
-    """Return the UID for *user*, or the current process's UID when None."""
+def resolve_uid(user: Optional[str]) -> Optional[int]:
+    """Return the UID for *user*, or *None* when no user is specified.
+
+    When *user* is ``None`` the caller should scan all accessible files
+    without restricting by ownership.
+    """
     if user is None:
-        return os.getuid()
+        return None
     try:
         return pwd.getpwnam(user).pw_uid
     except KeyError:
@@ -170,7 +186,7 @@ def _is_under_complete_prefix(path: str, complete: Set[str]) -> bool:
 
 def scan(
     root: Path,
-    uid: int,
+    uid: Optional[int],
     host_id: str,
     session: Session,
     complete_prefixes: Set[str],
@@ -180,11 +196,14 @@ def scan(
     Directories already marked *complete* in the database are skipped so that
     an interrupted scan can be resumed efficiently.
 
-    Only file-system entries owned by *uid* are stored in the ``files`` table.
+    When *uid* is given, only file-system entries owned by that uid are stored
+    in the ``files`` table.  When *uid* is ``None``, all accessible entries are
+    stored and users are inserted into the ``users`` table as they are
+    encountered.
+
     Every directory that is actually entered is recorded in the ``prefixes``
-    table with the **direct** size of user-owned entries found inside it; the
-    aggregate (recursive) sizes are computed afterwards by
-    :func:`update_prefix_sizes`.
+    table with the **direct** size of entries found inside it; the aggregate
+    (recursive) sizes are computed afterwards by :func:`update_prefix_sizes`.
     """
     dirs_to_visit: list[Path] = [root]
 
@@ -214,27 +233,41 @@ def scan(
             if entry.is_dir(follow_symlinks=False):
                 dirs_to_visit.append(Path(entry.path))
 
-            if st.st_uid != uid:
+            if uid is not None and st.st_uid != uid:
                 continue
 
             kind = file_kind(st.st_mode)
             size = st.st_size
             direct_size += size
-            _upsert_file(session, host_id, entry.path, size, kind)
+            _upsert_user(session, st.st_uid)
+            _upsert_file(session, host_id, entry.path, size, kind, st.st_uid)
 
         _upsert_prefix(session, host_id, current_str, direct_size, complete=True)
         session.commit()
 
 
+def _upsert_user(session: Session, uid: int) -> None:
+    if session.get(UserRecord, uid) is not None:
+        return
+    try:
+        username = pwd.getpwuid(uid).pw_name
+    except KeyError:
+        username = str(uid)
+    session.add(UserRecord(uid=uid, username=username))
+
+
 def _upsert_file(
-    session: Session, host_id: str, path: str, size: int, kind: str
+    session: Session, host_id: str, path: str, size: int, kind: str, uid: int
 ) -> None:
     existing = session.get(FileRecord, (host_id, path))
     if existing is not None:
         existing.size = size
         existing.kind = kind
+        existing.uid = uid
     else:
-        session.add(FileRecord(host_id=host_id, path=path, size=size, kind=kind))
+        session.add(
+            FileRecord(host_id=host_id, path=path, size=size, kind=kind, uid=uid)
+        )
 
 
 def _upsert_prefix(
@@ -851,7 +884,11 @@ def main(argv: Optional[list[str]] = None) -> None:
 
         print(
             f"Scanning {root!s} "
-            f"for files owned by uid={uid} on {host_id}"
+            + (
+                f"for files owned by uid={uid} on {host_id}"
+                if uid is not None
+                else f"for all accessible files on {host_id}"
+            )
             + (
                 f" (skipping {len(complete_prefixes)} complete prefix(es))"
                 if complete_prefixes

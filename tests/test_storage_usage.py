@@ -29,6 +29,8 @@ from storage_usage import (
     build_parser,
     file_kind,
     format_size,
+    format_tree_report,
+    generate_directory_tree,
     generate_summary_html,
     load_complete_prefixes,
     main,
@@ -684,3 +686,187 @@ class TestServeDB:
         body = resp.read().decode()
         assert 'type="range"' in body
         assert "substring" in body
+
+
+# ---------------------------------------------------------------------------
+# Directory tree tests
+# ---------------------------------------------------------------------------
+
+
+class TestGenerateDirectoryTree:
+    def test_returns_none_when_no_data(self, session):
+        result = generate_directory_tree(session, HOST, max_depth=3)
+        assert result is None
+
+    def test_returns_none_for_negative_depth(self, tmp_tree, session):
+        uid = os.getuid()
+        scan(tmp_tree, uid, HOST, session, set())
+        update_prefix_sizes(session, HOST)
+        result = generate_directory_tree(session, HOST, max_depth=-1)
+        assert result is None
+
+    def test_basic_tree_all_users(self, tmp_tree, session):
+        uid = os.getuid()
+        scan(tmp_tree, uid, HOST, session, set())
+        update_prefix_sizes(session, HOST)
+
+        tree = generate_directory_tree(session, HOST, max_depth=3)
+        assert tree is not None
+        assert tree["path"] == str(tmp_tree)
+        assert tree["size"] >= 10 + 20 + 30  # a.txt + b.txt + c.txt
+        assert tree["depth"] == 0
+
+    def test_tree_has_children(self, tmp_tree, session):
+        uid = os.getuid()
+        scan(tmp_tree, uid, HOST, session, set())
+        update_prefix_sizes(session, HOST)
+
+        tree = generate_directory_tree(session, HOST, max_depth=3)
+        assert tree is not None
+        # The "sub" directory should appear as a child.
+        child_paths = [c["path"] for c in tree["children"]]
+        assert str(tmp_tree / "sub") in child_paths
+
+    def test_children_sorted_by_size_desc(self, tmp_tree, session):
+        uid = os.getuid()
+        scan(tmp_tree, uid, HOST, session, set())
+        update_prefix_sizes(session, HOST)
+
+        tree = generate_directory_tree(session, HOST, max_depth=3)
+        assert tree is not None
+        sizes = [c["size"] for c in tree["children"]]
+        assert sizes == sorted(sizes, reverse=True)
+
+    def test_depth_zero_no_children(self, tmp_tree, session):
+        uid = os.getuid()
+        scan(tmp_tree, uid, HOST, session, set())
+        update_prefix_sizes(session, HOST)
+
+        tree = generate_directory_tree(session, HOST, max_depth=0)
+        assert tree is not None
+        assert tree["children"] == []
+
+    def test_tree_with_uid_filter(self, tmp_tree, session):
+        uid = os.getuid()
+        scan(tmp_tree, uid, HOST, session, set())
+        update_prefix_sizes(session, HOST)
+
+        tree = generate_directory_tree(session, HOST, max_depth=3, uid=uid)
+        assert tree is not None
+        assert tree["size"] >= 10 + 20 + 30
+
+    def test_tree_with_nonexistent_uid_returns_none_or_zero(self, tmp_tree, session):
+        scan(tmp_tree, uid=None, host_id=HOST, session=session, complete_prefixes=set())
+        update_prefix_sizes(session, HOST)
+
+        # uid=999999 owns no files, so the tree should either be None or have size 0.
+        tree = generate_directory_tree(session, HOST, max_depth=3, uid=999999)
+        assert tree is None or tree["size"] == 0
+
+    def test_formatted_size_present(self, tmp_tree, session):
+        uid = os.getuid()
+        scan(tmp_tree, uid, HOST, session, set())
+        update_prefix_sizes(session, HOST)
+
+        tree = generate_directory_tree(session, HOST, max_depth=3)
+        assert tree is not None
+        assert "formatted_size" in tree
+        assert isinstance(tree["formatted_size"], str)
+
+
+class TestFormatTreeReport:
+    def _make_tree(self) -> dict:
+        return {
+            "path": "/data",
+            "size": 160 * 1024**3,
+            "formatted_size": "160.0 GB",
+            "depth": 0,
+            "children": [
+                {
+                    "path": "/data/subdir1",
+                    "size": 80 * 1024**3,
+                    "formatted_size": "80.0 GB",
+                    "depth": 1,
+                    "children": [],
+                },
+                {
+                    "path": "/data/subdir2",
+                    "size": 80 * 1024**3,
+                    "formatted_size": "80.0 GB",
+                    "depth": 1,
+                    "children": [],
+                },
+            ],
+        }
+
+    def test_no_data_message(self):
+        assert format_tree_report(None) == "No data available."
+
+    def test_all_users_header(self):
+        report = format_tree_report(self._make_tree())
+        assert "All Users" in report
+
+    def test_username_in_header(self):
+        report = format_tree_report(self._make_tree(), username="alice")
+        assert "User: alice" in report
+
+    def test_root_path_in_report(self):
+        report = format_tree_report(self._make_tree())
+        assert "/data" in report
+
+    def test_child_paths_in_report(self):
+        report = format_tree_report(self._make_tree())
+        assert "/data/subdir1" in report
+        assert "/data/subdir2" in report
+
+    def test_sizes_in_report(self):
+        report = format_tree_report(self._make_tree())
+        assert "160.0 GB" in report
+        assert "80.0 GB" in report
+
+    def test_children_indented(self):
+        report = format_tree_report(self._make_tree())
+        lines = report.splitlines()
+        child_lines = [l for l in lines if "subdir1" in l or "subdir2" in l]
+        assert all(l.startswith("    -") for l in child_lines)
+
+
+class TestDirectoryTreeCLI:
+    def test_directory_tree_flag_parsed(self):
+        parser = build_parser()
+        args = parser.parse_args(["/some/path", "--directory-tree"])
+        assert args.directory_tree is True
+
+    def test_depth_default(self):
+        parser = build_parser()
+        args = parser.parse_args(["/some/path"])
+        assert args.depth == 3
+
+    def test_depth_custom(self):
+        parser = build_parser()
+        args = parser.parse_args(["/some/path", "--directory-tree", "--depth", "5"])
+        assert args.depth == 5
+
+    def test_directory_tree_printed_after_scan(self, tmp_tree, tmp_path, capsys):
+        db_url = f"sqlite:///{tmp_path / 'test.db'}"
+        main([str(tmp_tree), "--db", db_url, "--directory-tree", "--depth", "2"])
+        captured = capsys.readouterr()
+        assert str(tmp_tree) in captured.out
+        # Formatted size should appear somewhere in the output.
+        assert any(unit in captured.out for unit in ("B", "KB", "MB", "GB", "TB"))
+
+    def test_directory_tree_standalone_no_path(self, tmp_tree, tmp_path, capsys):
+        db_url = f"sqlite:///{tmp_path / 'test.db'}"
+        # First scan to populate the database.
+        main([str(tmp_tree), "--db", db_url])
+        capsys.readouterr()  # discard scan output
+        # Now query the existing database without re-scanning.
+        main(["--db", db_url, "--directory-tree", "--depth", "2"])
+        captured = capsys.readouterr()
+        assert str(tmp_tree) in captured.out
+
+    def test_missing_path_still_errors_without_directory_tree(self, capsys):
+        with pytest.raises(SystemExit):
+            main([])
+        captured = capsys.readouterr()
+        assert "PATH" in captured.err

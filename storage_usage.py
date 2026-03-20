@@ -313,6 +313,171 @@ def update_prefix_sizes(session: Session, host_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Directory tree report
+# ---------------------------------------------------------------------------
+
+
+def generate_directory_tree(
+    session: Session,
+    host_id: str,
+    max_depth: int,
+    uid: Optional[int] = None,
+) -> Optional[dict]:
+    """Generate a hierarchical tree of directories with disk usage up to *max_depth*.
+
+    Uses :class:`PrefixRecord` as an indexed lookup source for efficient
+    queries.  When *uid* is provided, only files owned by that user are
+    included; otherwise all users are aggregated.
+
+    Returns a nested dict of the form::
+
+        {
+            "path": "/scan/root",
+            "size": 160000000000,
+            "formatted_size": "160.0 GB",
+            "depth": 0,
+            "children": [
+                {"path": "/scan/root/subdir1", "size": 80000000000, ...},
+                ...
+            ]
+        }
+
+    Returns ``None`` when no complete prefixes exist for the host.
+    """
+    if max_depth < 0:
+        return None
+
+    # Load all complete prefix records for this host.
+    prefixes = (
+        session.query(PrefixRecord)
+        .filter(PrefixRecord.host_id == host_id, PrefixRecord.complete.is_(True))
+        .all()
+    )
+
+    if not prefixes:
+        return None
+
+    prefix_map: dict[str, PrefixRecord] = {p.prefix: p for p in prefixes}
+    all_prefix_paths: set[str] = set(prefix_map.keys())
+
+    # Find root paths: complete prefixes that are not nested under any other
+    # complete prefix.
+    roots = sorted(
+        p
+        for p in all_prefix_paths
+        if not any(
+            p.startswith(other + os.sep)
+            for other in all_prefix_paths
+            if p != other
+        )
+    )
+
+    if not roots:
+        return None
+
+    # When filtering by user, pre-compute recursive sizes from FileRecord.
+    # Walk each file's directory hierarchy once to accumulate sizes per prefix
+    # in O(n * d) time, where n is the number of files and d is the path depth.
+    user_prefix_sizes: Optional[dict[str, int]] = None
+    if uid is not None:
+        files = (
+            session.query(FileRecord.path, FileRecord.size)
+            .filter(FileRecord.host_id == host_id, FileRecord.uid == uid)
+            .all()
+        )
+        user_prefix_sizes = {p: 0 for p in prefix_map}
+        for fpath, size in files:
+            current = os.path.dirname(fpath)
+            while current:
+                if current in user_prefix_sizes:
+                    user_prefix_sizes[current] += size
+                parent = os.path.dirname(current)
+                if parent == current:  # reached the filesystem root
+                    break
+                current = parent
+
+    def _get_size(prefix_path: str) -> int:
+        if user_prefix_sizes is not None:
+            return user_prefix_sizes.get(prefix_path, 0)
+        rec = prefix_map.get(prefix_path)
+        return rec.size if rec is not None else 0
+
+    def _build_node(prefix_path: str, current_depth: int) -> Optional[dict]:
+        total_size = _get_size(prefix_path)
+
+        children: list[dict] = []
+        if current_depth < max_depth:
+            seen: set[str] = set()
+            prefix_with_sep = prefix_path + os.sep
+            for p in all_prefix_paths:
+                if not p.startswith(prefix_with_sep):
+                    continue
+                relative = p[len(prefix_with_sep):]
+                # Direct child: no separator in the relative portion.
+                child_path = prefix_with_sep + relative.split(os.sep)[0]
+                if child_path not in seen and child_path in all_prefix_paths:
+                    seen.add(child_path)
+                    child_node = _build_node(child_path, current_depth + 1)
+                    if child_node is not None:
+                        children.append(child_node)
+
+        if total_size == 0 and not children:
+            return None
+
+        return {
+            "path": prefix_path,
+            "size": total_size,
+            "formatted_size": format_size(total_size),
+            "depth": current_depth,
+            "children": sorted(children, key=lambda x: x["size"], reverse=True),
+        }
+
+    if len(roots) == 1:
+        return _build_node(roots[0], 0)
+
+    # Multiple scan roots: wrap them in a virtual top-level node.
+    root_nodes = [n for r in roots if (n := _build_node(r, 0)) is not None]
+    if not root_nodes:
+        return None
+    total = sum(n["size"] for n in root_nodes)
+    return {
+        "path": os.sep,
+        "size": total,
+        "formatted_size": format_size(total),
+        "depth": 0,
+        "children": sorted(root_nodes, key=lambda x: x["size"], reverse=True),
+    }
+
+
+def format_tree_report(
+    tree: Optional[dict],
+    username: Optional[str] = None,
+) -> str:
+    """Format a directory tree dict as a human-readable text report.
+
+    The tree is the structure returned by :func:`generate_directory_tree`.
+    Pass *username* to include a header line identifying the user.
+    """
+    if tree is None:
+        return "No data available."
+
+    lines: list[str] = []
+    if username:
+        lines.append(f"User: {username}\n")
+    else:
+        lines.append("All Users\n")
+
+    def _add_lines(node: dict, indent: int = 0) -> None:
+        indent_str = "    " * indent + ("- " if indent > 0 else "")
+        lines.append(f"{indent_str}{node['path']:<50} {node['formatted_size']:>12}")
+        for child in node["children"]:
+            _add_lines(child, indent + 1)
+
+    _add_lines(tree)
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # HTML summary
 # ---------------------------------------------------------------------------
 
@@ -852,6 +1017,23 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="{0..7}",
         help="ionice(1) priority level within the class (0–7).",
     )
+    parser.add_argument(
+        "--directory-tree",
+        action="store_true",
+        default=False,
+        help=(
+            "Print a hierarchical directory tree with disk usage to stdout. "
+            "Can be combined with a scan or used standalone against an "
+            "existing database (PATH is then optional)."
+        ),
+    )
+    parser.add_argument(
+        "--depth",
+        type=int,
+        default=3,
+        metavar="N",
+        help="Maximum directory depth for --directory-tree (default: 3).",
+    )
     return parser
 
 
@@ -866,43 +1048,48 @@ def main(argv: Optional[list[str]] = None) -> None:
         serve_db(engine, args.port)
         return
 
-    # Scan mode – PATH is required.
-    if args.path is None:
-        parser.error("PATH is required unless --serve is given")
-
-    # Re-exec under nice/ionice before doing any real work.
-    apply_nice_ionice(args.nice, args.ionice_class, args.ionice_level)
-
-    # Resolve to an absolute realpath so that the stored paths are canonical.
-    root = args.path.resolve()
+    # Scan mode – PATH is required unless only --directory-tree is requested.
+    if args.path is None and not args.directory_tree:
+        parser.error("PATH is required unless --serve or --directory-tree is given")
 
     uid = resolve_uid(args.user)
     host_id = socket.getfqdn()
 
     with Session(engine) as session:
-        complete_prefixes = load_complete_prefixes(session, host_id)
+        if args.path is not None:
+            # Re-exec under nice/ionice before doing any real work.
+            apply_nice_ionice(args.nice, args.ionice_class, args.ionice_level)
 
-        print(
-            f"Scanning {root!s} "
-            + (
-                f"for files owned by uid={uid} on {host_id}"
-                if uid is not None
-                else f"for all accessible files on {host_id}"
+            # Resolve to an absolute realpath so that stored paths are canonical.
+            root = args.path.resolve()
+
+            complete_prefixes = load_complete_prefixes(session, host_id)
+
+            print(
+                f"Scanning {root!s} "
+                + (
+                    f"for files owned by uid={uid} on {host_id}"
+                    if uid is not None
+                    else f"for all accessible files on {host_id}"
+                )
+                + (
+                    f" (skipping {len(complete_prefixes)} complete prefix(es))"
+                    if complete_prefixes
+                    else ""
+                )
             )
-            + (
-                f" (skipping {len(complete_prefixes)} complete prefix(es))"
-                if complete_prefixes
-                else ""
-            )
-        )
 
-        scan(root, uid, host_id, session, complete_prefixes)
-        update_prefix_sizes(session, host_id)
+            scan(root, uid, host_id, session, complete_prefixes)
+            update_prefix_sizes(session, host_id)
 
-        print("Scan complete.")
+            print("Scan complete.")
 
-        if args.summary_html is not None:
-            generate_summary_html(session, args.summary_html)
+            if args.summary_html is not None:
+                generate_summary_html(session, args.summary_html)
+
+        if args.directory_tree:
+            tree = generate_directory_tree(session, host_id, args.depth, uid)
+            print(format_tree_report(tree, args.user))
 
 
 if __name__ == "__main__":

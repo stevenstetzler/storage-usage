@@ -792,7 +792,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--user",
         default=None,
         metavar="USER",
-        help="Only include files owned by USER (default: current user).",
+        help="Only include files owned by USER (default: No user).",
     )
     parser.add_argument(
         "--db",
